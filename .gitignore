@@ -1,3 +1,6 @@
 .env
 __pycache__
 cot_interp.egg-info/
+.venv-visu
+results/
+results$

@@ -45,6 +45,14 @@ conda env create -f environment.yaml
 conda activate stllms_env
 ```
 
+   **Alternatively, with [uv](https://docs.astral.sh/uv/)** (Python 3.10+):
+   ```bash
+   uv venv --python 3.10
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+   uv pip install -r requirements.txt
+   uv pip install -e .
+   ```
+
 3. Install the package in development mode:
 ```bash
 pip install -e .

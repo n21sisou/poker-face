@@ -202,6 +202,91 @@ def _safe_lighteval_metric_blob(value: Any) -> Any:
     return str(value)
 
 
+def _resolve_shared_model_path(model_name: str) -> str:
+    """
+    Prefer shared model storage when available, to mirror evaluate_gsm8k.py behavior.
+    """
+    if not model_name or model_name.startswith("/"):
+        return model_name
+    if "/" not in model_name:
+        return model_name
+
+    shared_path = f"/Brain/public/models/{model_name}"
+    if os.path.exists(shared_path):
+        print(f"Using shared model path: {shared_path}")
+        return shared_path
+    return model_name
+
+
+def _build_model_config(args: argparse.Namespace) -> TransformersModelConfig:
+    """
+    Build a TransformersModelConfig compatible with multiple LightEval versions.
+    """
+    fields = getattr(TransformersModelConfig, "model_fields", {}) or {}
+    field_names = set(fields.keys())
+
+    model_value = _resolve_shared_model_path(args.model)
+    kwargs: dict[str, Any] = {}
+
+    for key in ("model_name", "pretrained"):
+        if key in field_names:
+            kwargs[key] = model_value
+            break
+
+    for key in ("batch_size",):
+        if key in field_names:
+            kwargs[key] = args.batch_size
+
+    for key in ("dtype", "torch_dtype"):
+        if key in field_names:
+            kwargs[key] = args.dtype
+            break
+
+    for key in ("use_chat_template", "chat_template"):
+        if key in field_names:
+            kwargs[key] = args.use_chat_template
+            break
+
+    max_tokens_set = False
+    for key in ("max_gen_toks", "max_new_tokens", "max_tokens"):
+        if key in field_names:
+            kwargs[key] = args.max_tokens
+            max_tokens_set = True
+            break
+
+    if not max_tokens_set and "generation_parameters" in field_names:
+        gp_candidates: list[Any] = [
+            {"max_new_tokens": args.max_tokens},
+            {"max_gen_toks": args.max_tokens},
+            {"max_tokens": args.max_tokens},
+        ]
+        try:
+            from lighteval.models.model_input import GenerationParameters
+
+            gp_candidates = [
+                GenerationParameters(max_new_tokens=args.max_tokens),
+                GenerationParameters(max_gen_toks=args.max_tokens),
+                GenerationParameters(max_tokens=args.max_tokens),
+            ] + gp_candidates
+        except Exception:
+            pass
+
+        for candidate in gp_candidates:
+            try:
+                test_kwargs = dict(kwargs)
+                test_kwargs["generation_parameters"] = candidate
+                return TransformersModelConfig(**test_kwargs)
+            except Exception:
+                continue
+
+        print(
+            "Warning: could not set max tokens on this LightEval version; "
+            "using its default generation length."
+        )
+
+    return TransformersModelConfig(**kwargs)
+
+
 def run_lighteval(args: argparse.Namespace) -> Any:
     print("=" * 80)
     print("GSM8K Evaluation (LightEval)")
@@ -226,13 +311,7 @@ def run_lighteval(args: argparse.Namespace) -> Any:
         max_samples=max_samples,
     )
 
-    model_config = TransformersModelConfig(
-        model_name=args.model,
-        batch_size=args.batch_size,
-        max_gen_toks=args.max_tokens,
-        dtype=args.dtype,
-        use_chat_template=args.use_chat_template,
-    )
+    model_config = _build_model_config(args)
 
     pipeline = Pipeline(
         tasks=args.task,

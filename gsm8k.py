@@ -7,7 +7,6 @@ LightEval outputs.
 """
 
 import argparse
-import glob
 import json
 import os
 import re
@@ -171,29 +170,45 @@ def _extract_model_response(model_response_obj: Any) -> str:
 
 
 def _find_latest_details_parquet(output_dir: str, task_hint: str) -> Path:
-    details_root = Path(output_dir) / "details"
-    if not details_root.exists():
-        raise FileNotFoundError(f"Details directory not found: {details_root}")
-
     task_slug = task_hint.replace("|", "_")
-    patterns = [
-        str(details_root / "**" / f"details_{task_slug}_*.parquet"),
-        str(details_root / "**" / "details_*gsm8k*.parquet"),
-        str(details_root / "**" / "details_*.parquet"),
+    output_path = Path(output_dir)
+    search_roots = [
+        output_path,
+        output_path / "details",
+        Path("results"),
+        Path("."),
     ]
 
-    candidates: list[str] = []
-    for pattern in patterns:
-        candidates.extend(glob.glob(pattern, recursive=True))
+    patterns = [
+        f"**/details_{task_slug}_*.parquet",
+        "**/details_*gsm8k*.parquet",
+        "**/details_*.parquet",
+    ]
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            for match in root.glob(pattern):
+                if match.is_file():
+                    resolved = match.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        candidates.append(resolved)
 
     if not candidates:
+        searched = ", ".join(str(root) for root in search_roots)
         raise FileNotFoundError(
-            f"No details parquet files found under {details_root}. "
-            "Run with --save_details or ensure LightEval wrote details files."
+            "No LightEval details parquet found. "
+            f"Searched roots: {searched}. "
+            "Pass --details_file explicitly if your LightEval run wrote to a custom path."
         )
 
-    latest = max(candidates, key=os.path.getmtime)
-    return Path(latest)
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return latest
 
 
 def _safe_lighteval_metric_blob(value: Any) -> Any:

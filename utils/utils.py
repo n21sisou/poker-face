@@ -12,7 +12,6 @@ dotenv.load_dotenv("../.env")
 
 
 def chat(prompt, model="gpt-4.1", max_tokens=28000):
-
     model_provider = ""
 
     if model in ["gpt-4o", "gpt-4.1"]:
@@ -138,6 +137,14 @@ def chat(prompt, model="gpt-4.1", max_tokens=28000):
             time.sleep(20)
 
     return None
+
+
+def count_tokens(text, tokenizer, exclude_padding=True):
+    enc = tokenizer(text, add_special_tokens=False)
+    input_ids = enc["input_ids"]
+    if exclude_padding and getattr(tokenizer, "pad_token_id", None) is not None:
+        input_ids = [i for i in input_ids if i != tokenizer.pad_token_id]
+    return len(input_ids)
 
 
 def get_char_to_token_map(text, tokenizer):

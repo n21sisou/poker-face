@@ -22,6 +22,28 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "utils"))
 import utils
 
 
+def _parse_numeric_candidate(text):
+    """Normalize common LaTeX/currency formatting and parse a number."""
+    if text is None:
+        return None
+
+    cleaned = str(text).strip()
+    cleaned = cleaned.replace("\\$", "")
+    cleaned = cleaned.replace("$", "")
+    cleaned = cleaned.replace("\\!", "")
+    cleaned = cleaned.replace("\\,", "")
+    cleaned = cleaned.replace(",", "")
+
+    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
 def extract_answer(text):
     """
     Extract the numerical answer from model output.
@@ -36,30 +58,27 @@ def extract_answer(text):
 
     # Look for common answer patterns
     patterns = [
-        r"####\s*([0-9,\.]+)",  # GSM8K format
-        r"the answer is[:\s]*\$?\s*([0-9,\.]+)",  # "the answer is X"
-        r"answer[:\s]*\$?\s*([0-9,\.]+)",  # "answer: X"
-        r"\\boxed\{([0-9,\.]+)\}",  # LaTeX boxed
-        r"= \$?\s*([0-9,\.]+)\s*$",  # Ends with "= X"
+        r"\\boxed\{([^}]*)\}",  # LaTeX boxed content
+        r"####\s*([^\n]+)",  # GSM8K format
+        r"final answer[:\s]*([^\n]+)",  # "Final Answer: ..."
+        r"the answer is[:\s]*([^\n]+)",  # "the answer is X"
+        r"answer[:\s]*([^\n]+)",  # "answer: X"
+        r"=\s*([^\n]+)\s*$",  # Ends with "= X"
     ]
 
     for pattern in patterns:
         match = re.search(pattern, answer_section, re.IGNORECASE)
         if match:
-            answer_str = match.group(1).replace(",", "")
-            try:
-                return float(answer_str)
-            except ValueError:
-                continue
+            parsed = _parse_numeric_candidate(match.group(1))
+            if parsed is not None:
+                return parsed
 
     # Fallback: extract last number in the answer section
-    numbers = re.findall(r"([0-9,\.]+)", answer_section)
+    numbers = re.findall(r"(-?\d[\d,]*(?:\.\d+)?)", answer_section)
     if numbers:
-        answer_str = numbers[-1].replace(",", "")
-        try:
-            return float(answer_str)
-        except ValueError:
-            pass
+        parsed = _parse_numeric_candidate(numbers[-1])
+        if parsed is not None:
+            return parsed
 
     return None
 
@@ -67,13 +86,9 @@ def extract_answer(text):
 def extract_ground_truth(answer_text):
     """Extract numerical answer from GSM8K ground truth format."""
     # GSM8K answers are in format: "#### 42"
-    match = re.search(r"####\s*([0-9,\.]+)", answer_text)
+    match = re.search(r"####\s*([^\n]+)", answer_text)
     if match:
-        answer_str = match.group(1).replace(",", "")
-        try:
-            return float(answer_str)
-        except ValueError:
-            return None
+        return _parse_numeric_candidate(match.group(1))
     return None
 
 
@@ -167,7 +182,7 @@ def evaluate_gsm8k(args):
 
         # Decode outputs
         responses = [
-            tokenizer.decode(output, skip_special_tokens=True) for output in outputs
+            tokenizer.decode(output, skip_special_tokens=False) for output in outputs
         ]
 
         # Evaluate each response

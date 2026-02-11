@@ -29,6 +29,8 @@ from tqdm import tqdm
 
 # Reuse extraction logic from evaluate_gsm8k.py
 from evaluate_gsm8k import extract_answer, extract_ground_truth
+from truncated_reasoning import _parse_percentages as parse_truncate_percentages
+from truncated_reasoning import create_truncated_variants
 
 # Add utils to path (same pattern as evaluate_gsm8k.py)
 sys.path.append(os.path.join(os.path.dirname(__file__), "utils"))
@@ -119,7 +121,9 @@ def _discover_input_files(input_jsons: str, input_glob: str) -> List[Path]:
     return deduped
 
 
-def _extract_truncation_percentage(payload: dict, rows: List[dict], path: Path) -> Optional[float]:
+def _extract_truncation_percentage(
+    payload: dict, rows: List[dict], path: Path
+) -> Optional[float]:
     top_level = _safe_float(payload.get("truncation_percentage"))
     if top_level is not None:
         return top_level
@@ -239,7 +243,9 @@ def _prepare_rows(
 
         ground_truth_answer = _safe_float(row.get("ground_truth_answer"))
         if ground_truth_answer is None:
-            ground_truth_answer = extract_ground_truth(str(row.get("ground_truth_solution", "")))
+            ground_truth_answer = extract_ground_truth(
+                str(row.get("ground_truth_solution", ""))
+            )
 
         prepared.append(
             {
@@ -249,7 +255,9 @@ def _prepare_rows(
                 "ground_truth_answer": ground_truth_answer,
                 "prompt_text": prompt,
                 "prompt_source_key": prompt_source_key,
-                "baseline_model_response": _extract_response_text(row.get("model_response")),
+                "baseline_model_response": _extract_response_text(
+                    row.get("model_response")
+                ),
                 "baseline_predicted_answer": _safe_float(row.get("predicted_answer")),
                 "baseline_is_correct": bool(row.get("is_correct"))
                 if row.get("is_correct") is not None
@@ -266,6 +274,10 @@ def _evaluate_variant(
     prepared_rows: List[dict],
     batch_size: int,
     max_tokens: int,
+    do_sample: bool,
+    num_responses_per_prompt: int,
+    temperature: float,
+    top_p: float,
     disable_tqdm: bool,
 ) -> Dict[str, Any]:
     rows_out: List[dict] = []
@@ -289,62 +301,84 @@ def _evaluate_variant(
 
         input_ids, prompt_token_lengths = _build_batched_input_ids(tokenizer, prompts)
 
-        with model.generate(
-            {
-                "input_ids": input_ids,
-                "attention_mask": (input_ids != tokenizer.pad_token_id).long(),
-            },
-            max_new_tokens=max_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-        ) as tracer:
-            outputs = model.generator.output.save()
+        for sample_idx in range(num_responses_per_prompt):
+            generation_kwargs = {
+                "max_new_tokens": max_tokens,
+                "pad_token_id": tokenizer.pad_token_id,
+            }
+            if do_sample:
+                generation_kwargs.update(
+                    {
+                        "do_sample": True,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                    }
+                )
 
-        decoded_outputs = _decode_batch_outputs(
-            outputs=outputs,
-            tokenizer=tokenizer,
-            max_input_len=input_ids.shape[1],
-        )
-
-        for row, prompt_len, decoded in zip(batch_rows, prompt_token_lengths, decoded_outputs):
-            full_text = decoded["full_text"]
-            generated_text = decoded["generated_text"]
-
-            predicted_answer = extract_answer(full_text)
-            ground_truth = row["ground_truth_answer"]
-
-            is_correct = False
-            if predicted_answer is not None and ground_truth is not None:
-                is_correct = abs(predicted_answer - ground_truth) < 1e-3
-
-            total += 1
-            if is_correct:
-                correct += 1
-
-            rows_out.append(
+            with model.generate(
                 {
-                    "row_index": row["row_index"],
-                    "question": row["question"],
-                    "ground_truth_solution": row["ground_truth_solution"],
-                    "ground_truth_answer": ground_truth,
-                    "prompt_source_key": row["prompt_source_key"],
-                    "prompt_text": row["prompt_text"],
-                    "prompt_chars": len(row["prompt_text"]),
-                    "prompt_tokens": prompt_len,
-                    "generated_continuation": generated_text,
-                    "continued_response": full_text,
-                    "predicted_answer": predicted_answer,
-                    "is_correct": is_correct,
-                    "baseline_model_response": row["baseline_model_response"],
-                    "baseline_predicted_answer": row["baseline_predicted_answer"],
-                    "baseline_is_correct": row["baseline_is_correct"],
-                }
+                    "input_ids": input_ids,
+                    "attention_mask": (input_ids != tokenizer.pad_token_id).long(),
+                },
+                **generation_kwargs,
+            ) as tracer:
+                outputs = model.generator.output.save()
+
+            decoded_outputs = _decode_batch_outputs(
+                outputs=outputs,
+                tokenizer=tokenizer,
+                max_input_len=input_ids.shape[1],
             )
+
+            for row, prompt_len, decoded in zip(
+                batch_rows, prompt_token_lengths, decoded_outputs
+            ):
+                full_text = decoded["full_text"]
+                generated_text = decoded["generated_text"]
+
+                predicted_answer = extract_answer(full_text)
+                ground_truth = row["ground_truth_answer"]
+
+                is_correct = False
+                if predicted_answer is not None and ground_truth is not None:
+                    is_correct = abs(predicted_answer - ground_truth) < 1e-3
+
+                total += 1
+                if is_correct:
+                    correct += 1
+
+                rows_out.append(
+                    {
+                        "row_index": row["row_index"],
+                        "sample_index": sample_idx,
+                        "question": row["question"],
+                        "ground_truth_solution": row["ground_truth_solution"],
+                        "ground_truth_answer": ground_truth,
+                        "prompt_source_key": row["prompt_source_key"],
+                        "prompt_text": row["prompt_text"],
+                        "prompt_chars": len(row["prompt_text"]),
+                        "prompt_tokens": prompt_len,
+                        "generated_continuation": generated_text,
+                        "continued_response": full_text,
+                        "predicted_answer": predicted_answer,
+                        "is_correct": is_correct,
+                        "baseline_model_response": row["baseline_model_response"],
+                        "baseline_predicted_answer": row["baseline_predicted_answer"],
+                        "baseline_is_correct": row["baseline_is_correct"],
+                    }
+                )
 
         torch.cuda.empty_cache()
         gc.collect()
 
     accuracy = correct / total if total > 0 else 0.0
-    return {"rows": rows_out, "correct": correct, "total": total, "accuracy": accuracy}
+    return {
+        "rows": rows_out,
+        "correct": correct,
+        "total": total,
+        "num_prompts": len(prepared_rows),
+        "accuracy": accuracy,
+    }
 
 
 def _build_nested_comparison(variant_results: List[dict]) -> List[dict]:
@@ -371,18 +405,26 @@ def _build_nested_comparison(variant_results: List[dict]) -> List[dict]:
                     "variants": {},
                 }
 
-            rows_by_index[row_idx]["variants"][variant_label] = {
-                "truncation_percentage": truncation_pct,
-                "source_file": source_file,
-                "prompt_source_key": row["prompt_source_key"],
-                "prompt_text": row["prompt_text"],
-                "prompt_chars": row["prompt_chars"],
-                "prompt_tokens": row["prompt_tokens"],
-                "generated_continuation": row["generated_continuation"],
-                "continued_response": row["continued_response"],
-                "predicted_answer": row["predicted_answer"],
-                "is_correct": row["is_correct"],
-            }
+            if variant_label not in rows_by_index[row_idx]["variants"]:
+                rows_by_index[row_idx]["variants"][variant_label] = {
+                    "truncation_percentage": truncation_pct,
+                    "source_file": source_file,
+                    "prompt_source_key": row["prompt_source_key"],
+                    "prompt_text": row["prompt_text"],
+                    "prompt_chars": row["prompt_chars"],
+                    "prompt_tokens": row["prompt_tokens"],
+                    "responses": [],
+                }
+
+            rows_by_index[row_idx]["variants"][variant_label]["responses"].append(
+                {
+                    "sample_index": row.get("sample_index", 0),
+                    "generated_continuation": row["generated_continuation"],
+                    "continued_response": row["continued_response"],
+                    "predicted_answer": row["predicted_answer"],
+                    "is_correct": row["is_correct"],
+                }
+            )
 
     return [rows_by_index[idx] for idx in sorted(rows_by_index.keys())]
 
@@ -413,6 +455,42 @@ def main() -> None:
         help="Comma-separated glob patterns for truncated JSON paths.",
     )
     parser.add_argument(
+        "--source_json",
+        type=str,
+        default="",
+        help=(
+            "Optional base JSON file to truncate first, then evaluate in one run. "
+            "When set, the script generates truncated variants and adds them to inputs."
+        ),
+    )
+    parser.add_argument(
+        "--truncate_percentages",
+        type=str,
+        default="0.25,0.5,0.75,1.0",
+        help=(
+            "Comma-separated percentages in [0,1] used with --source_json, "
+            "e.g. '0.1,0.2,0.5'."
+        ),
+    )
+    parser.add_argument(
+        "--truncate_response_key",
+        type=str,
+        default="model_response",
+        help="Response key to truncate when using --source_json.",
+    )
+    parser.add_argument(
+        "--truncate_forced_prefix",
+        type=str,
+        default="**Final Answer:**\n",
+        help="Prefix injected after forced </think> when using --source_json.",
+    )
+    parser.add_argument(
+        "--truncated_output_dir",
+        type=str,
+        default="results/gsm8k/truncated",
+        help="Directory for generated truncated JSONs (used with --source_json).",
+    )
+    parser.add_argument(
         "--response_key",
         type=str,
         default="model_response_truncated",
@@ -441,6 +519,30 @@ def main() -> None:
         type=int,
         default=256,
         help="Maximum number of newly generated tokens per continuation.",
+    )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        default=False,
+        help="Enable stochastic decoding (sampling).",
+    )
+    parser.add_argument(
+        "--num_responses_per_prompt",
+        type=int,
+        default=1,
+        help="Number of continuations to generate per prompt when sampling is enabled.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (used with --do_sample).",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.95,
+        help="Top-p nucleus sampling value (used with --do_sample).",
     )
     parser.add_argument(
         "--load_in_8bit",
@@ -477,10 +579,23 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    input_files = _discover_input_files(args.input_jsons, args.input_glob)
+    discovered_files: List[Path] = []
+    if args.source_json:
+        truncate_percentages = parse_truncate_percentages(args.truncate_percentages)
+        generated_paths = create_truncated_variants(
+            input_json=args.source_json,
+            percentages=truncate_percentages,
+            response_key=args.truncate_response_key,
+            forced_prefix=args.truncate_forced_prefix,
+            output_dir=args.truncated_output_dir,
+        )
+        discovered_files.extend(generated_paths)
+
+    discovered_files.extend(_discover_input_files(args.input_jsons, args.input_glob))
+    input_files = sorted({path.resolve() for path in discovered_files})
     if not input_files:
         raise ValueError(
-            "No input files found. Provide --input_jsons and/or --input_glob."
+            "No input files found. Provide --source_json and/or --input_jsons and/or --input_glob."
         )
 
     print("=" * 80)
@@ -490,13 +605,36 @@ def main() -> None:
     print(f"Input files: {len(input_files)}")
     for path in input_files:
         print(f"  - {path}")
+    if args.source_json:
+        print(f"Source JSON (truncate+evaluate): {args.source_json}")
+        print(f"Truncate percentages: {args.truncate_percentages}")
+        print(f"Truncated output dir: {args.truncated_output_dir}")
     print(f"Response key: {args.response_key}")
     print(f"Fallback key: {args.fallback_response_key}")
     print(f"N samples per file: {args.n_samples}")
     print(f"Batch size: {args.batch_size}")
     print(f"Max tokens: {args.max_tokens}")
+    print(f"Do sample: {args.do_sample}")
+    print(f"Responses per prompt: {args.num_responses_per_prompt}")
+    if args.do_sample:
+        print(f"Temperature: {args.temperature}")
+        print(f"Top-p: {args.top_p}")
     print(f"Load in 8-bit: {args.load_in_8bit}")
     print("=" * 80)
+
+    if args.num_responses_per_prompt < 1:
+        raise ValueError("--num_responses_per_prompt must be >= 1.")
+    if args.temperature <= 0:
+        raise ValueError("--temperature must be > 0.")
+    if not (0 < args.top_p <= 1):
+        raise ValueError("--top_p must be in (0, 1].")
+
+    effective_num_responses = args.num_responses_per_prompt if args.do_sample else 1
+    if args.num_responses_per_prompt > 1 and not args.do_sample:
+        print(
+            "Warning: --num_responses_per_prompt > 1 but --do_sample is off; "
+            "using 1 deterministic response per prompt."
+        )
 
     print(f"\nLoading model {args.model}...")
     model, tokenizer, _ = utils.load_model_and_vectors(
@@ -548,6 +686,10 @@ def main() -> None:
             prepared_rows=variant["prepared_rows"],
             batch_size=args.batch_size,
             max_tokens=args.max_tokens,
+            do_sample=args.do_sample,
+            num_responses_per_prompt=effective_num_responses,
+            temperature=args.temperature,
+            top_p=args.top_p,
             disable_tqdm=args.disable_tqdm,
         )
 
@@ -562,7 +704,8 @@ def main() -> None:
                 "truncation_percentage": variant["truncation_percentage"],
                 "source_file": variant["path"],
                 "records_key": variant["records_key"],
-                "n_samples": len(evaluation["rows"]),
+                "n_prompts": evaluation["num_prompts"],
+                "n_responses": len(evaluation["rows"]),
                 "correct": evaluation["correct"],
                 "total": evaluation["total"],
                 "accuracy": evaluation["accuracy"],
@@ -577,7 +720,8 @@ def main() -> None:
             "variant_label": variant["variant_label"],
             "truncation_percentage": variant["truncation_percentage"],
             "source_file": variant["source_file"],
-            "n_samples": variant["n_samples"],
+            "n_prompts": variant["n_prompts"],
+            "n_responses": variant["n_responses"],
             "correct": variant["correct"],
             "total": variant["total"],
             "accuracy": variant["accuracy"],
@@ -591,7 +735,9 @@ def main() -> None:
         os.makedirs(args.output_dir, exist_ok=True)
         model_id = args.model.split("/")[-1].lower()
         date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path(args.output_dir) / f"gsm8k_{model_id}_{date}.truncated_compare.json"
+        output_path = (
+            Path(args.output_dir) / f"gsm8k_{model_id}_{date}.truncated_compare.json"
+        )
 
     output_payload = {
         "model": args.model,
@@ -602,6 +748,10 @@ def main() -> None:
             "n_samples": args.n_samples,
             "batch_size": args.batch_size,
             "max_tokens": args.max_tokens,
+            "do_sample": args.do_sample,
+            "num_responses_per_prompt": effective_num_responses,
+            "temperature": args.temperature if args.do_sample else None,
+            "top_p": args.top_p if args.do_sample else None,
             "load_in_8bit": args.load_in_8bit,
             "seed": args.seed,
         },

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 THINK_OPEN = "<think>"
@@ -174,6 +175,58 @@ def _parse_percentages(value: str) -> List[float]:
     return percentages
 
 
+def create_truncated_variants(
+    input_json: str,
+    percentages: List[float],
+    response_key: str = "model_response",
+    forced_prefix: str = "\nFinal Answer: ",
+    output_dir: str = "results/gsm8k/truncated",
+) -> List[Path]:
+    """
+    Create truncated variants and return the written file paths.
+
+    This is the programmatic API used by evaluate_truncated_gsm8k.py to support
+    a one-command truncate+evaluate workflow.
+    """
+    with open(input_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    records_key = _pick_records_key(data)
+
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(input_json))[0]
+    output_paths: List[Path] = []
+
+    for pct in percentages:
+        out_data = dict(data)
+        out_results = []
+        for row in data[records_key]:
+            row_copy = dict(row)
+            response = _extract_response_text(row_copy.get(response_key, ""))
+            truncated = truncate_by_percentage(
+                response=response,
+                percentage=pct,
+                forced_prefix=forced_prefix,
+            )
+            row_copy[f"{response_key}_truncated"] = truncated
+            row_copy["truncation_percentage"] = pct
+            row_copy["truncation_original_chars"] = len(
+                extract_thinking_process(response)
+            )
+            out_results.append(row_copy)
+
+        out_data[records_key] = out_results
+        out_data["truncation_percentage"] = pct
+
+        out_path = Path(output_dir) / f"{base_name}.truncated_{int(pct * 100):03d}.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(out_data, f, indent=2)
+        print(f"Saved: {out_path}")
+        output_paths.append(out_path)
+
+    return output_paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create CoT-truncated variants from a results JSON file."
@@ -205,48 +258,19 @@ def main() -> None:
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="results/gsm8k",
+        default="results/gsm8k/truncated",
         help="Directory for truncated output files.",
     )
     args = parser.parse_args()
 
     percentages = _parse_percentages(args.percentages)
-
-    with open(args.input_json, "r") as f:
-        data = json.load(f)
-
-    records_key = _pick_records_key(data)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    base_name = os.path.splitext(os.path.basename(args.input_json))[0]
-
-    for pct in percentages:
-        out_data = dict(data)
-        out_results = []
-        for row in data[records_key]:
-            row_copy = dict(row)
-            response = _extract_response_text(row_copy.get(args.response_key, ""))
-            truncated = truncate_by_percentage(
-                response=response,
-                percentage=pct,
-                forced_prefix=args.forced_prefix,
-            )
-            row_copy[f"{args.response_key}_truncated"] = truncated
-            row_copy["truncation_percentage"] = pct
-            row_copy["truncation_original_chars"] = len(
-                extract_thinking_process(response)
-            )
-            out_results.append(row_copy)
-
-        out_data[records_key] = out_results
-        out_data["truncation_percentage"] = pct
-
-        out_path = os.path.join(
-            args.output_dir, f"{base_name}.truncated_{int(pct * 100):03d}.json"
-        )
-        with open(out_path, "w") as f:
-            json.dump(out_data, f, indent=2)
-        print(f"Saved: {out_path}")
+    create_truncated_variants(
+        input_json=args.input_json,
+        percentages=percentages,
+        response_key=args.response_key,
+        forced_prefix=args.forced_prefix,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":
